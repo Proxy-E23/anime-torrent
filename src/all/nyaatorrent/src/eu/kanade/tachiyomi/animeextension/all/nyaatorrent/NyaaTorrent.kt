@@ -53,7 +53,6 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         val anime = SAnime.create()
         anime.setUrlWithoutDomain(element.select("td:nth-child(2) a").attr("href"))
         anime.title = element.select("td:nth-child(2) a:not(.comments)").attr("title")
-        // anime.thumbnail_url = "$baseUrl/" + element.select("td:nth-child(1) img").attr("src")
         return anime
     }
 
@@ -78,13 +77,26 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     override fun latestUpdatesNextPageSelector(): String = animeNextPageSelector
 
     // =============================== Search ===============================
-    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = if (query.startsWith(PREFIX_SEARCH)) { // URL intent handler
-        val id = query.removePrefix(PREFIX_SEARCH)
-        client.newCall(GET("$baseUrl/anime/$id"))
-            .awaitSuccess()
-            .use(::searchAnimeByIdParse)
-    } else {
-        super.getSearchAnime(page, query, filters)
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = when {
+        query.startsWith(PREFIX_SEARCH) -> {
+            val id = query.removePrefix(PREFIX_SEARCH)
+            client.newCall(GET("$baseUrl/view/$id"))
+                .awaitSuccess()
+                .use(::searchAnimeByIdParse)
+        }
+        query.startsWith(PREFIX_GROUP) -> {
+            val realQuery = query.removePrefix(PREFIX_GROUP)
+            val encodedQuery = URLEncoder.encode(realQuery, "UTF-8")
+            val categoryParam = if (extId == 1) "1_0" else "1_1"
+            val anime = SAnime.create().apply {
+                title = "\uD83D\uDDC2 $realQuery"
+                url = "/?f=0&c=$categoryParam&s=id&o=desc&q=$encodedQuery&p=1&grouped=1"
+                thumbnail_url = null
+                description = "Búsqueda agrupada: \"$realQuery\"\n\nTodos los episodios de todos los torrents que coincidan con esta búsqueda."
+            }
+            AnimesPage(listOf(anime), false)
+        }
+        else -> super.getSearchAnime(page, query, filters)
     }
 
     private fun searchAnimeByIdParse(response: Response): AnimesPage {
@@ -93,7 +105,8 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     }
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
+        val cleanQuery = if (query.startsWith(PREFIX_GROUP)) query.removePrefix(PREFIX_GROUP) else query
+        val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
         var sortParam = "id"
         var sortDirection = "desc"
         var filterParam = "0"
@@ -104,11 +117,8 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
                     sortParam = availableSorts[filter.state?.index ?: 0].id
                     sortDirection = if (filter.state?.ascending == true) "asc" else "desc"
                 }
-
                 is FilterList -> filterParam = availableFilters[filter.state].id
-
                 is CategoriesList -> categoryParam = availableCategories[filter.state].id
-
                 else -> {}
             }
         }
@@ -122,7 +132,6 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     // =========================== Anime Details ============================
     override fun animeDetailsParse(document: Document): SAnime {
         val anime = SAnime.create()
-
         val category = document.select("div.panel-body > div:nth-child(1) > div:nth-child(2)").text()
         val seeders = document.select("div.panel-body > div:nth-child(2) > div:nth-child(4)").text()
         val leechers = document.select("div.panel-body > div:nth-child(3) > div:nth-child(4) > span").text()
@@ -138,7 +147,6 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         anime.author = document.select("a[title=user]").text()
         val imageRegex = Regex("""\b(http|https)?:\S+(?:jpg|png|gif|bmp|webp|tiff|jpeg)(?!\.html)\b""", RegexOption.IGNORE_CASE)
         val match = imageRegex.find(desc)
-
         if (match != null) {
             anime.thumbnail_url = match.value
         }
@@ -149,28 +157,74 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     override fun episodeListSelector() = "div.torrent-file-list ul li li"
 
     override fun episodeListParse(response: Response): List<SEpisode> {
+        val url = response.request.url.toString()
+        if (url.contains("grouped=1")) {
+            return episodeListGroupedParse(url)
+        }
+        return episodeListSingleParse(response)
+    }
+
+    private fun episodeListGroupedParse(groupedUrl: String): List<SEpisode> {
+        val rawQuery = groupedUrl.substringAfter("&q=").substringBefore("&")
+        val categoryParam = groupedUrl.substringAfter("&c=").substringBefore("&")
+        val encodedQuery = rawQuery
+
+        val torrentDetailUrls = mutableListOf<String>()
+        var page = 1
+        var hasNextPage = true
+        while (hasNextPage) {
+            val searchUrl = "$baseUrl/?f=0&c=$categoryParam&s=id&o=desc&q=$encodedQuery&p=$page"
+            val searchDoc = client.newCall(GET(searchUrl)).execute().use { it.asJsoup() }
+            searchDoc.select("$animeSelector td:nth-child(2) a:not(.comments)").forEach { a ->
+                val href = a.attr("href")
+                if (href.isNotEmpty()) torrentDetailUrls.add("$baseUrl$href")
+            }
+            hasNextPage = searchDoc.selectFirst(animeNextPageSelector) != null
+            page++
+            if (page > 10) break
+        }
+
+        val allEpisodes = mutableListOf<SEpisode>()
+        for (detailUrl in torrentDetailUrls) {
+            try {
+                val detailResponse = client.newCall(GET(detailUrl)).execute()
+                val episodes = episodeListSingleParse(detailResponse)
+                allEpisodes.addAll(episodes)
+            } catch (e: Exception) {
+                // Skip dead/broken torrents
+            }
+        }
+
+        var episodeNumber = allEpisodes.size.toFloat()
+        allEpisodes.forEach { ep ->
+            ep.episode_number = episodeNumber
+            if (!preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)) {
+                ep.name = "Episodio ${episodeNumber.toInt()}"
+            }
+            episodeNumber--
+        }
+        return allEpisodes
+    }
+
+    private fun episodeListSingleParse(response: Response): List<SEpisode> {
         val document = response.asJsoup()
-        // val torrentMagnet = document.select("a.card-footer-item:contains(Magnet)").attr("href")
         val torrentFile = "$baseUrl${document.selectFirst("div.panel-footer a")?.attr("href").orEmpty()}"
         val torrentDate = parseDate(document.select("div.panel-body > div:nth-child(1) > div:nth-child(4)").text())
-        try {
+        return try {
             val torrent = TorrentUtils.getTorrentInfo(torrentFile, "torrent")
             val torrentIndexed = torrent.files
             val torrentTracker = torrent.trackers.filter { it.trim().isNotEmpty() }.joinToString("") { "&tr=$it" }
             val torrentMagnet = "magnet:?xt=urn:btih:${torrent.hash}&dn=${torrent.hash}"
 
             var episodeNumber = 1F
-            return torrentIndexed
+            torrentIndexed
                 .filter { it.path.substringAfterLast('.').lowercase(Locale.ROOT) in validExtensions }
                 .map {
                     SEpisode.create().apply {
                         name = if (preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)) {
                             it.path.trim().split('/').last()
                         } else {
-                            it.path.trim()
-                                .replace("[", "(")
-                                .replace(Regex("]"), ")")
-                                .replace("/", "\uD83D\uDCC2 ")
+                            "Episodio ${episodeNumber.toInt()}"
                         }
                         url = "$torrentMagnet$torrentTracker&index=${it.indexFile}"
                         episode_number = episodeNumber++
@@ -193,7 +247,6 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         val kilobytes = bytes / 1024.0
         val megabytes = kilobytes / 1024.0
         val gigabytes = megabytes / 1024.0
-
         return when {
             gigabytes >= 1 -> String.format("%.2f GB", gigabytes)
             megabytes >= 1 -> String.format("%.2f MB", megabytes)
@@ -204,15 +257,13 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     override fun episodeFromElement(element: Element) = throw Exception("Not used")
 
     // ============================ Video Links =============================
-
     override suspend fun getVideoList(episode: SEpisode): List<Video> = listOf(Video(episode.url, episode.name, episode.url))
 
     override fun videoListSelector() = throw Exception("Not used")
-
     override fun videoFromElement(element: Element) = throw Exception("Not used")
-
     override fun videoUrlParse(document: Document) = throw Exception("Not used")
 
+    // ========================== Preferences ==============================
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
             key = PREF_DOMAIN_KEY
@@ -239,7 +290,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             setOnPreferenceChangeListener { _, newValue ->
                 preferences.edit().putBoolean(key, newValue as Boolean).commit()
             }
-            summary = "Will note display full path of episode."
+            summary = "Will not display full path of episode."
         }.also(screen::addPreference)
     }
 
@@ -290,10 +341,9 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
 
     companion object {
         const val PREFIX_SEARCH = "id:"
+        const val PREFIX_GROUP = "group:"
 
-        // Domain
         private const val PREF_DOMAIN_KEY = "domain"
-
         private const val IS_FILENAME_KEY = "filename"
         private const val IS_FILENAME_DEFAULT = false
 
