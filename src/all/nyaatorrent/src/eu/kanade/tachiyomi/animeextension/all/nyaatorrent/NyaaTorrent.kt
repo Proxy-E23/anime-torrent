@@ -47,6 +47,8 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     // ============================== Shared ===============================
     private val animeSelector = "table.torrent-list tbody tr"
     private val animeNextPageSelector = "ul.pagination a[rel='next']"
+    private val videoExtensions = setOf("mkv", "mp4", "avi", "ogm", "wmv", "ts", "m2ts", "flv")
+
     private fun animeFromElement(element: Element): SAnime {
         val anime = SAnime.create()
         anime.setUrlWithoutDomain(element.select("td:nth-child(2) a").attr("href"))
@@ -75,26 +77,29 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     override fun latestUpdatesNextPageSelector(): String = animeNextPageSelector
 
     // =============================== Search ===============================
-    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = when {
-        query.startsWith(PREFIX_SEARCH) -> {
-            val id = query.removePrefix(PREFIX_SEARCH)
-            client.newCall(GET("$baseUrl/view/$id"))
-                .awaitSuccess()
-                .use(::searchAnimeByIdParse)
-        }
-        query.startsWith(PREFIX_GROUP) -> {
-            val realQuery = query.removePrefix(PREFIX_GROUP)
-            val encodedQuery = URLEncoder.encode(realQuery, "UTF-8")
-            val categoryParam = if (extId == 1) "1_0" else "1_1"
-            val anime = SAnime.create().apply {
-                title = "\uD83D\uDDC2 $realQuery"
-                url = "/?f=0&c=$categoryParam&s=id&o=desc&q=$encodedQuery&p=1&grouped=1"
-                thumbnail_url = null
-                description = "Búsqueda agrupada: \"$realQuery\"\n\nTodos los episodios de todos los torrents que coincidan con esta búsqueda."
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        val shouldGroup = filters.filterIsInstance<GroupFilter>().firstOrNull()?.state == true && query.isNotEmpty()
+        return when {
+            query.startsWith(PREFIX_SEARCH) -> {
+                val id = query.removePrefix(PREFIX_SEARCH)
+                client.newCall(GET("$baseUrl/view/$id"))
+                    .awaitSuccess()
+                    .use(::searchAnimeByIdParse)
             }
-            AnimesPage(listOf(anime), false)
+            shouldGroup || query.startsWith(PREFIX_GROUP) -> {
+                val realQuery = if (query.startsWith(PREFIX_GROUP)) query.removePrefix(PREFIX_GROUP) else query
+                val encodedQuery = URLEncoder.encode(realQuery, "UTF-8")
+                val categoryParam = if (extId == 1) "1_0" else "1_1"
+                val anime = SAnime.create().apply {
+                    title = "\uD83D\uDDC2 $realQuery"
+                    url = "/?f=0&c=$categoryParam&s=id&o=desc&q=$encodedQuery&p=1&grouped=1"
+                    thumbnail_url = null
+                    description = "Búsqueda agrupada: \"$realQuery\"\n\nTodos los episodios de todos los torrents que coincidan con esta búsqueda."
+                }
+                AnimesPage(listOf(anime), false)
+            }
+            else -> super.getSearchAnime(page, query, filters)
         }
-        else -> super.getSearchAnime(page, query, filters)
     }
 
     private fun searchAnimeByIdParse(response: Response): AnimesPage {
@@ -103,7 +108,13 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     }
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val cleanQuery = if (query.startsWith(PREFIX_GROUP)) query.removePrefix(PREFIX_GROUP) else query
+        val groupFilter = filters.filterIsInstance<GroupFilter>().firstOrNull()
+        val shouldGroup = groupFilter?.state == true && query.isNotEmpty()
+        val cleanQuery = when {
+            shouldGroup -> query
+            query.startsWith(PREFIX_GROUP) -> query.removePrefix(PREFIX_GROUP)
+            else -> query
+        }
         val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
         var sortParam = "id"
         var sortDirection = "desc"
@@ -120,7 +131,8 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
                 else -> {}
             }
         }
-        return GET("$baseUrl/?f=$filterParam&c=$categoryParam&s=$sortParam&o=$sortDirection&q=$encodedQuery&p=$page")
+        val groupedParam = if (shouldGroup) "&grouped=1" else ""
+        return GET("$baseUrl/?f=$filterParam&c=$categoryParam&s=$sortParam&o=$sortDirection&q=$encodedQuery&p=$page$groupedParam")
     }
 
     override fun searchAnimeSelector() = animeSelector
@@ -152,7 +164,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     }
 
     // ============================== Episodes ==============================
-    override fun episodeListSelector() = "div.torrent-file-list ul li li"
+    override fun episodeListSelector() = "div.torrent-file-list ul li"
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val url = response.request.url.toString()
@@ -162,10 +174,6 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         return episodeListSingleParseHtml(response)
     }
 
-    // ------------------------------------------------------------------
-    // Grouped: recorre cada página de resultados y por cada torrent
-    // extrae el episodio con puro HTML. TorrentUtils NO se llama aquí.
-    // ------------------------------------------------------------------
     private fun episodeListGroupedParse(groupedUrl: String): List<SEpisode> {
         val encodedQuery = groupedUrl.substringAfter("&q=").substringBefore("&")
         val categoryParam = groupedUrl.substringAfter("&c=").substringBefore("&")
@@ -195,7 +203,6 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             }
         }
 
-        // Numerar en orden descendente (más reciente = número mayor)
         var episodeNumber = allEpisodes.size.toFloat()
         allEpisodes.forEach { ep ->
             ep.episode_number = episodeNumber
@@ -207,33 +214,84 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         return allEpisodes
     }
 
-    // ------------------------------------------------------------------
-    // Single torrent: construye el SEpisode SOLO con HTML.
-    // El magnet completo (con trackers) está en la propia página de Nyaa,
-    // así que no se necesita parsear el .torrent para reproducir.
-    // TorrentUtils se llama en getVideoList(), justo antes de reproducir.
-    // ------------------------------------------------------------------
+    // Extrae todos los li de video ignorando carpetas (li que contienen ul)
+    private fun extractVideoFiles(document: Document): List<Pair<Int, Element>> {
+        val allLi = document.select("div.torrent-file-list ul li")
+        val result = mutableListOf<Pair<Int, Element>>()
+        var globalIndex = 0
+        for (li in allLi) {
+            // Si tiene ul hijo es carpeta, se salta pero cuenta para el index
+            if (li.selectFirst("ul") != null) continue
+            val fileName = li.ownText().trim()
+            val ext = fileName.substringAfterLast(".").lowercase()
+            if (ext in videoExtensions) {
+                result.add(Pair(globalIndex, li))
+            }
+            globalIndex++
+        }
+        return result
+    }
+
     private fun episodeListSingleParseHtml(response: Response): List<SEpisode> {
         val document = response.asJsoup()
         val magnet = document.selectFirst("a[href^='magnet:']")?.attr("href").orEmpty()
         if (magnet.isEmpty()) return emptyList()
 
-        val title = document.select("h3.panel-title").text()
-            .ifEmpty { response.request.url.pathSegments.lastOrNull().orEmpty() }
         val torrentDate = parseDate(
             document.select("div.panel-body > div:nth-child(1) > div:nth-child(4)").text(),
         )
-        val filesize = document.select("div.panel-body > div:nth-child(4) > div:nth-child(2)").text()
+        val useFilename = preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)
+        val videoFiles = extractVideoFiles(document)
+
+        // Múltiples archivos de video → un episodio por archivo
+        if (videoFiles.size > 1) {
+            return videoFiles.mapIndexed { listIndex, (originalIndex, li) ->
+                val fileName = li.ownText().trim()
+                val fileSize = li.select("span.file-size").text()
+                val epNumber = extractEpisodeNumber(fileName) ?: (videoFiles.size - listIndex).toFloat()
+                SEpisode.create().apply {
+                    name = if (useFilename) fileName else "Episodio ${epNumber.toInt()}"
+                    url = "$magnet&index=$originalIndex"
+                    episode_number = epNumber
+                    scanlator = fileSize
+                    date_upload = torrentDate
+                }
+            }.sortedByDescending { it.episode_number }
+        }
+
+        // Un solo archivo de video → leer nombre desde file list si existe, si no desde el título del panel
+        val singleFile = videoFiles.firstOrNull()
+        val fileName = singleFile?.second?.ownText()?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: document.select("h3.panel-title").text()
+        val fileSize = singleFile?.second?.select("span.file-size")?.text()
+            ?: document.select("div.panel-body > div:nth-child(4) > div:nth-child(2)").text()
 
         return listOf(
             SEpisode.create().apply {
-                name = if (preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)) title else "Episodio 1"
+                name = if (useFilename) fileName else "Episodio 1"
                 url = magnet
                 episode_number = 1F
-                scanlator = filesize
+                scanlator = fileSize
                 date_upload = torrentDate
             },
         )
+    }
+
+    private fun extractEpisodeNumber(fileName: String): Float? {
+        val patterns = listOf(
+            Regex("""[-\s](\d{1,4})v\d"""),
+            Regex("""[-\s](\d{1,4})[\s\.(]"""),
+            Regex("""[Ee][Pp]?(\d{1,4})"""),
+            Regex("""_(\d{1,4})_"""),
+        )
+        for (pattern in patterns) {
+            val match = pattern.find(fileName)
+            if (match != null) {
+                return match.groupValues[1].toFloatOrNull()
+            }
+        }
+        return null
     }
 
     private fun parseDate(dateStr: String): Long = runCatching { DATE_FORMATTER.parse(dateStr)?.time }
@@ -253,12 +311,8 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     override fun episodeFromElement(element: Element) = throw Exception("Not used")
 
     // ============================ Video Links =============================
-    // Aquí sí se llama TorrentUtils, solo cuando el usuario va a reproducir.
-    // En ese momento Anikku ya tiene el servicio torrent disponible.
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
         val magnetUrl = episode.url
-        // Si el magnet ya trae &index= es porque viene de un torrent con
-        // múltiples archivos (flujo legacy); se pasa directo.
         return listOf(Video(magnetUrl, episode.name, magnetUrl))
     }
 
@@ -336,10 +390,13 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         )
     }
 
+    private class GroupFilter : AnimeFilter.CheckBox("Agrupar resultados")
+
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
         SortList(availableSorts.map { it.name }.toTypedArray()),
         FilterList(availableFilters.map { it.name }.toTypedArray()),
         CategoriesList(availableCategories.map { it.name }.toTypedArray()),
+        GroupFilter(),
     )
 
     companion object {
