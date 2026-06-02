@@ -435,7 +435,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             SEpisode.create().apply {
                 name = epName
                 url = "$magnet&index=${file.index}"
-                episode_number = realEpNumber
+                episode_number = file.index.toFloat()
                 scanlator = fileSize
                 date_upload = torrentDate
             }
