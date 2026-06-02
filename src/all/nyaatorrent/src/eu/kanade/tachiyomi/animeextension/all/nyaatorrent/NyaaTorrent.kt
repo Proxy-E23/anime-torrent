@@ -142,6 +142,12 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     // =========================== Anime Details ============================
     override fun animeDetailsParse(document: Document): SAnime {
         val anime = SAnime.create()
+
+        val torrentId = document.location()
+            .substringAfter("/view/")
+            .substringBefore("/")
+            .substringBefore("#")
+
         val category = document.select("div.panel-body > div:nth-child(1) > div:nth-child(2)").text()
         val seeders = document.select("div.panel-body > div:nth-child(2) > div:nth-child(4)").text()
         val leechers = document.select("div.panel-body > div:nth-child(3) > div:nth-child(4) > span").text()
@@ -152,8 +158,16 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         genre.add("Leechers: $leechers")
         genre.add("File Size: $filesize")
         anime.genre = genre.joinToString(", ")
+
         val desc = document.select("#torrent-description").text()
-        anime.description = desc
+
+        anime.description = buildString {
+            if (torrentId.isNotEmpty()) {
+                append("ID: $torrentId\n\n")
+            }
+            append(desc)
+        }
+
         anime.author = document.select("a[title=user]").text()
         val imageRegex = Regex("""\b(http|https)?:\S+(?:jpg|png|gif|bmp|webp|tiff|jpeg)(?!\.html)\b""", RegexOption.IGNORE_CASE)
         val match = imageRegex.find(desc)
@@ -203,33 +217,156 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             }
         }
 
-        var episodeNumber = allEpisodes.size.toFloat()
         allEpisodes.forEach { ep ->
-            ep.episode_number = episodeNumber
+            val realNumber = ep.episode_number
             if (!preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)) {
-                ep.name = "Episodio ${episodeNumber.toInt()}"
+                ep.name = "Episodio ${realNumber.toInt()}"
             }
-            episodeNumber--
         }
         return allEpisodes
     }
 
-    // Extrae todos los li de video ignorando carpetas (li que contienen ul)
-    private fun extractVideoFiles(document: Document): List<Pair<Int, Element>> {
-        val allLi = document.select("div.torrent-file-list ul li")
-        val result = mutableListOf<Pair<Int, Element>>()
+    // ============================== Folder-aware file extraction ==============================
+
+    private data class VideoFile(
+        val index: Int,
+        val element: Element,
+        val parentFolder: String,
+        val subFolder: String,
+    )
+
+    private val folderKeywordRegex = Regex(
+        """(season|part|cour|temporada|s)[\s._-]*(\d+)""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    private fun extractShortFolderName(rawName: String): String {
+        val match = folderKeywordRegex.find(rawName) ?: return ""
+        val keyword = match.groupValues[1].lowercase().let { kw ->
+            when {
+                kw == "s" || kw == "season" -> "Season"
+                kw == "part" -> "Part"
+                kw == "cour" -> "Cour"
+                kw == "temporada" -> "Temporada"
+                else -> kw.replaceFirstChar { it.uppercase() }
+            }
+        }
+        val number = match.groupValues[2].trimStart('0').ifEmpty { "1" }
+        return "$keyword $number"
+    }
+
+    private fun extractVideoFiles(document: Document): List<VideoFile> {
+        val result = mutableListOf<VideoFile>()
         var globalIndex = 0
-        for (li in allLi) {
-            // Si tiene ul hijo es carpeta, se salta pero cuenta para el index
-            if (li.selectFirst("ul") != null) continue
+
+        val rootUl = document.selectFirst("div.torrent-file-list > ul") ?: return result
+
+        fun getChildUl(li: Element): Element? = li.children().firstOrNull { it.tagName() == "ul" }
+
+        fun isRootFolder(li: Element): Boolean = getChildUl(li)?.hasAttr("data-show") == true
+
+        fun processFile(li: Element, parent: String, sub: String) {
             val fileName = li.ownText().trim()
             val ext = fileName.substringAfterLast(".").lowercase()
             if (ext in videoExtensions) {
-                result.add(Pair(globalIndex, li))
+                result.add(VideoFile(globalIndex, li, parent, sub))
             }
             globalIndex++
         }
+
+        fun processSubFolderChildren(ul: Element, parent: String, sub: String) {
+            for (li in ul.children()) {
+                val childUl = getChildUl(li)
+                if (childUl != null) {
+                    for (leaf in childUl.children()) {
+                        processFile(leaf, parent, sub)
+                    }
+                } else {
+                    processFile(li, parent, sub)
+                }
+            }
+        }
+
+        fun processFolderChildren(ul: Element, parent: String) {
+            for (li in ul.children()) {
+                val childUl = getChildUl(li)
+                if (childUl != null) {
+                    val subName = li.selectFirst("a.folder")?.text()?.trim() ?: li.ownText().trim()
+                    processSubFolderChildren(childUl, parent, subName)
+                } else {
+                    processFile(li, parent, "")
+                }
+            }
+        }
+
+        for (li in rootUl.children()) {
+            val childUl = getChildUl(li)
+            if (childUl != null && isRootFolder(li)) {
+                for (child in childUl.children()) {
+                    val childChildUl = getChildUl(child)
+                    if (childChildUl != null) {
+                        val folderName = child.selectFirst("a.folder")?.text()?.trim() ?: child.ownText().trim()
+                        processFolderChildren(childChildUl, folderName)
+                    } else {
+                        processFile(child, "", "")
+                    }
+                }
+            } else if (childUl != null) {
+                val folderName = li.selectFirst("a.folder")?.text()?.trim() ?: li.ownText().trim()
+                processFolderChildren(childUl, folderName)
+            } else {
+                processFile(li, "", "")
+            }
+        }
+
         return result
+    }
+
+    private fun buildEpisodeName(
+        file: VideoFile,
+        episodeNumber: Int,
+        realEpisodeNumber: Float,
+        isExtra: Boolean,
+        useFilename: Boolean,
+        unknownFolderMap: Map<String, Int>,
+    ): String {
+        val fileName = file.element.ownText().trim()
+
+        val parentLabel = if (file.parentFolder.isEmpty()) {
+            ""
+        } else {
+            val short = extractShortFolderName(file.parentFolder)
+            if (short.isNotEmpty()) {
+                short
+            } else {
+                if (useFilename) {
+                    file.parentFolder
+                } else {
+                    val partN = unknownFolderMap[file.parentFolder] ?: 1
+                    "Parte $partN"
+                }
+            }
+        }
+
+        val subLabel = if (file.subFolder.isEmpty()) {
+            ""
+        } else {
+            if (useFilename) file.subFolder else "Extras"
+        }
+
+        val prefix = when {
+            parentLabel.isNotEmpty() && subLabel.isNotEmpty() -> "$parentLabel/$subLabel: "
+            parentLabel.isNotEmpty() -> "$parentLabel: "
+            subLabel.isNotEmpty() -> "$subLabel: "
+            else -> ""
+        }
+
+        return if (useFilename) {
+            "$prefix$fileName"
+        } else {
+            val label = if (isExtra) "Extra $episodeNumber" else "Episodio ${realEpisodeNumber.toInt()}"
+            "$prefix$label"
+        }
     }
 
     private fun episodeListSingleParseHtml(response: Response): List<SEpisode> {
@@ -243,39 +380,68 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         val useFilename = preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)
         val videoFiles = extractVideoFiles(document)
 
-        // Múltiples archivos de video → un episodio por archivo
-        if (videoFiles.size > 1) {
-            return videoFiles.mapIndexed { listIndex, (originalIndex, li) ->
-                val fileName = li.ownText().trim()
-                val fileSize = li.select("span.file-size").text()
-                val epNumber = extractEpisodeNumber(fileName) ?: (videoFiles.size - listIndex).toFloat()
+        if (videoFiles.isEmpty()) return emptyList()
+
+        // Caso especial: un solo archivo sin carpetas → comportamiento original sin &index
+        if (videoFiles.size == 1 && videoFiles[0].parentFolder.isEmpty() && videoFiles[0].subFolder.isEmpty()) {
+            val singleFile = videoFiles[0]
+            val fileName = singleFile.element.ownText().trim()
+                .takeIf { it.isNotEmpty() }
+                ?: document.select("h3.panel-title").text()
+            val fileSize = singleFile.element.select("span.file-size").text()
+                .ifEmpty { document.select("div.panel-body > div:nth-child(4) > div:nth-child(2)").text() }
+            val realNumber = extractEpisodeNumber(fileName) ?: 1f
+            return listOf(
                 SEpisode.create().apply {
-                    name = if (useFilename) fileName else "Episodio ${epNumber.toInt()}"
-                    url = "$magnet&index=$originalIndex"
-                    episode_number = epNumber
+                    name = if (useFilename) fileName else "Episodio ${realNumber.toInt()}"
+                    url = magnet
+                    episode_number = realNumber
                     scanlator = fileSize
                     date_upload = torrentDate
-                }
-            }.sortedByDescending { it.episode_number }
+                },
+            )
         }
 
-        // Un solo archivo de video → leer nombre desde file list si existe, si no desde el título del panel
-        val singleFile = videoFiles.firstOrNull()
-        val fileName = singleFile?.second?.ownText()?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?: document.select("h3.panel-title").text()
-        val fileSize = singleFile?.second?.select("span.file-size")?.text()
-            ?: document.select("div.panel-body > div:nth-child(4) > div:nth-child(2)").text()
+        // Construir mapa de carpetas no reconocibles → "Parte N"
+        val unknownFolderMap = mutableMapOf<String, Int>()
+        var partCounter = 1
+        videoFiles
+            .map { it.parentFolder }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .forEach { folder ->
+                if (extractShortFolderName(folder).isEmpty()) {
+                    unknownFolderMap[folder] = partCounter++
+                }
+            }
 
-        return listOf(
+        val episodeCounterByFolder = mutableMapOf<String, Int>()
+        val extraCounterByFolder = mutableMapOf<String, Int>()
+
+        val episodes = videoFiles.map { file ->
+            val folderKey = file.parentFolder
+            val isExtra = file.subFolder.isNotEmpty()
+
+            val counter = if (isExtra) extraCounterByFolder else episodeCounterByFolder
+            val current = (counter[folderKey] ?: 0) + 1
+            counter[folderKey] = current
+
+            val fileName = file.element.ownText().trim()
+            val realEpNumber = extractEpisodeNumber(fileName) ?: file.index.toFloat()
+
+            val epName = buildEpisodeName(file, current, realEpNumber, isExtra, useFilename, unknownFolderMap)
+            val fileSize = file.element.select("span.file-size").text()
+
             SEpisode.create().apply {
-                name = if (useFilename) fileName else "Episodio 1"
-                url = magnet
-                episode_number = 1F
+                name = epName
+                url = "$magnet&index=${file.index}"
+                episode_number = realEpNumber
                 scanlator = fileSize
                 date_upload = torrentDate
-            },
-        )
+            }
+        }
+
+        return episodes.sortedByDescending { it.episode_number }
     }
 
     private fun extractEpisodeNumber(fileName: String): Float? {
@@ -296,17 +462,6 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
 
     private fun parseDate(dateStr: String): Long = runCatching { DATE_FORMATTER.parse(dateStr)?.time }
         .getOrNull() ?: 0L
-
-    private fun convertBytesToReadable(bytes: Long): String {
-        val kilobytes = bytes / 1024.0
-        val megabytes = kilobytes / 1024.0
-        val gigabytes = megabytes / 1024.0
-        return when {
-            gigabytes >= 1 -> String.format("%.2f GB", gigabytes)
-            megabytes >= 1 -> String.format("%.2f MB", megabytes)
-            else -> String.format("%.2f KB", kilobytes)
-        }
-    }
 
     override fun episodeFromElement(element: Element) = throw Exception("Not used")
 
