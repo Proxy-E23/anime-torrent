@@ -86,6 +86,14 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
                     .awaitSuccess()
                     .use(::searchAnimeByIdParse)
             }
+            query.startsWith(PREFIX_DBATCH) -> {
+                val parts = query.removePrefix(PREFIX_DBATCH).split(":")
+                val id = parts[0]
+                val rangeSpec = parts.getOrNull(1)
+                client.newCall(GET("$baseUrl/view/$id"))
+                    .awaitSuccess()
+                    .use { response -> searchAnimeByDbatchParse(response, id, rangeSpec) }
+            }
             shouldGroup || query.startsWith(PREFIX_GROUP) -> {
                 val realQuery = if (query.startsWith(PREFIX_GROUP)) query.removePrefix(PREFIX_GROUP) else query
                 val encodedQuery = URLEncoder.encode(realQuery, "UTF-8")
@@ -105,6 +113,84 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     private fun searchAnimeByIdParse(response: Response): AnimesPage {
         val details = animeDetailsParse(response.use { it.asJsoup() })
         return AnimesPage(listOf(details), false)
+    }
+
+    private fun parseRangeSpec(rangeSpec: String, videoFiles: List<VideoFile>): List<VideoFile> = try {
+        val segments = rangeSpec.split("--")
+        val rangePart = segments.first()
+        val excluded = segments.drop(1).mapNotNull { it.toIntOrNull() }.toSet()
+        val rangeBounds = rangePart.split("-")
+        val from = rangeBounds.getOrNull(0)?.toIntOrNull() ?: 0
+        val to = rangeBounds.getOrNull(1)?.toIntOrNull() ?: videoFiles.last().index
+        videoFiles.filter { it.index in from..to && it.index !in excluded }
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    private fun searchAnimeByDbatchParse(
+        response: Response,
+        torrentId: String,
+        rangeSpec: String? = null,
+    ): AnimesPage {
+        val document = response.asJsoup()
+        val magnet = document.selectFirst("a[href^='magnet:']")?.attr("href").orEmpty()
+        if (magnet.isEmpty()) return AnimesPage(emptyList(), false)
+
+        val videoFiles = extractVideoFiles(document)
+        if (videoFiles.isEmpty()) return AnimesPage(emptyList(), false)
+
+        val torrentTitle = document.select("h3.panel-title").text()
+
+        // Con rango → un solo SAnime agrupado listo para la biblioteca
+        if (rangeSpec != null) {
+            val filteredFiles = parseRangeSpec(rangeSpec, videoFiles)
+            if (filteredFiles.isEmpty()) return AnimesPage(emptyList(), false)
+            val indices = filteredFiles.joinToString(",") { it.index.toString() }
+            val anime = SAnime.create().apply {
+                title = torrentTitle
+                url = "/view/$torrentId?dbatch=$indices"
+                thumbnail_url = null
+                description = "Parte de: $torrentTitle\nRango: $rangeSpec"
+            }
+            return AnimesPage(listOf(anime), false)
+        }
+
+        // Sin rango → modo exploración
+        data class GroupKey(val parent: String, val sub: String)
+        val groups = videoFiles.groupBy { GroupKey(it.parentFolder, it.subFolder) }
+
+        val animes = if (groups.size == 1) {
+            // Tipo plano: un SAnime por archivo con [N] como ayuda visual
+            videoFiles.map { file ->
+                val fileName = file.element.ownText().trim().substringBeforeLast(".")
+                SAnime.create().apply {
+                    title = "[${file.index}] $fileName"
+                    url = "/view/$torrentId?dbatch=${file.index}"
+                    thumbnail_url = null
+                    description = "Parte de: $torrentTitle"
+                }
+            }
+        } else {
+            // Tipo con carpetas: un SAnime por grupo
+            groups.map { (key, files) ->
+                val indices = files.joinToString(",") { it.index.toString() }
+                val label = when {
+                    key.parent.isNotEmpty() && key.sub.isNotEmpty() ->
+                        "${key.parent} / ${key.sub}"
+                    key.parent.isNotEmpty() -> key.parent
+                    key.sub.isNotEmpty() -> key.sub
+                    else -> torrentTitle
+                }
+                SAnime.create().apply {
+                    title = label
+                    url = "/view/$torrentId?dbatch=$indices"
+                    thumbnail_url = null
+                    description = "Parte de: $torrentTitle"
+                }
+            }
+        }
+
+        return AnimesPage(animes, false)
     }
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
@@ -147,6 +233,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             .substringAfter("/view/")
             .substringBefore("/")
             .substringBefore("#")
+            .substringBefore("?")
 
         val category = document.select("div.panel-body > div:nth-child(1) > div:nth-child(2)").text()
         val seeders = document.select("div.panel-body > div:nth-child(2) > div:nth-child(4)").text()
@@ -182,10 +269,69 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val url = response.request.url.toString()
-        if (url.contains("grouped=1")) {
-            return episodeListGroupedParse(url)
+        return when {
+            url.contains("grouped=1") -> episodeListGroupedParse(url)
+            url.contains("dbatch=") -> episodeListDbatchParse(response)
+            else -> episodeListSingleParseHtml(response)
         }
-        return episodeListSingleParseHtml(response)
+    }
+
+    private fun episodeListDbatchParse(response: Response): List<SEpisode> {
+        val document = response.asJsoup()
+        val magnet = document.selectFirst("a[href^='magnet:']")?.attr("href").orEmpty()
+        if (magnet.isEmpty()) return emptyList()
+
+        val rawDbatch = response.request.url.queryParameter("dbatch") ?: return emptyList()
+        val allowedIndices = rawDbatch.split(",").mapNotNull { it.trim().toIntOrNull() }.toSet()
+
+        val torrentDate = parseDate(
+            document.select("div.panel-body > div:nth-child(1) > div:nth-child(4)").text(),
+        )
+        val useFilename = preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)
+        val videoFiles = extractVideoFiles(document).filter { it.index in allowedIndices }
+
+        if (videoFiles.isEmpty()) return emptyList()
+
+        val unknownFolderMap = mutableMapOf<String, Int>()
+        var partCounter = 1
+        videoFiles
+            .map { it.parentFolder }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .forEach { folder ->
+                if (extractShortFolderName(folder).isEmpty()) {
+                    unknownFolderMap[folder] = partCounter++
+                }
+            }
+
+        val episodeCounterByFolder = mutableMapOf<String, Int>()
+        val extraCounterByFolder = mutableMapOf<String, Int>()
+
+        val episodes = videoFiles.mapIndexed { localIndex, file ->
+            val folderKey = file.parentFolder
+            val isExtra = file.subFolder.isNotEmpty()
+            val counter = if (isExtra) extraCounterByFolder else episodeCounterByFolder
+            val current = (counter[folderKey] ?: 0) + 1
+            counter[folderKey] = current
+
+            val fileName = file.element.ownText().trim()
+            val realEpNumber = extractEpisodeNumber(fileName) ?: (localIndex + 1).toFloat()
+            val fileSize = file.element.select("span.file-size").text()
+
+            SEpisode.create().apply {
+                name = if (useFilename) {
+                    fileName
+                } else {
+                    if (isExtra) "Extra $current" else "Episodio ${realEpNumber.toInt()}"
+                }
+                url = "$magnet&index=${file.index}"
+                episode_number = (localIndex + 1).toFloat()
+                scanlator = fileSize
+                date_upload = torrentDate
+            }
+        }
+
+        return episodes.sortedByDescending { it.episode_number }
     }
 
     private fun episodeListGroupedParse(groupedUrl: String): List<SEpisode> {
@@ -217,10 +363,11 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             }
         }
 
+        // Renombrar usando el número extraído del nombre actual, no de episode_number
         allEpisodes.forEach { ep ->
-            val realNumber = ep.episode_number
             if (!preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)) {
-                ep.name = "Episodio ${realNumber.toInt()}"
+                val epNumber = extractEpisodeNumber(ep.name) ?: ep.episode_number
+                ep.name = "Episodio ${epNumber.toInt()}"
             }
         }
         return allEpisodes
@@ -382,7 +529,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
 
         if (videoFiles.isEmpty()) return emptyList()
 
-        // Caso especial: un solo archivo sin carpetas → comportamiento original sin &index
+        // Caso especial: un solo archivo sin carpetas
         if (videoFiles.size == 1 && videoFiles[0].parentFolder.isEmpty() && videoFiles[0].subFolder.isEmpty()) {
             val singleFile = videoFiles[0]
             val fileName = singleFile.element.ownText().trim()
@@ -395,14 +542,13 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
                 SEpisode.create().apply {
                     name = if (useFilename) fileName else "Episodio ${realNumber.toInt()}"
                     url = magnet
-                    episode_number = realNumber
+                    episode_number = 1f // ← interno siempre 1, evita missing items
                     scanlator = fileSize
                     date_upload = torrentDate
                 },
             )
         }
 
-        // Construir mapa de carpetas no reconocibles → "Parte N"
         val unknownFolderMap = mutableMapOf<String, Int>()
         var partCounter = 1
         videoFiles
@@ -446,16 +592,22 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
 
     private fun extractEpisodeNumber(fileName: String): Float? {
         val patterns = listOf(
+            Regex("""[Ee]pisodio\s+(\d+)"""),
             Regex("""[-\s](\d{1,4})v\d"""),
-            Regex("""[-\s](\d{1,4})[\s\.(]"""),
+            Regex("""[-\s](\d{1,2})_(\d)\s*[\[\(]"""),
+            Regex("""[-\s]0*(\d{1,2})\s*[\[\(]"""),
             Regex("""[Ee][Pp]?(\d{1,4})"""),
+            Regex("""[-\s](\d{1,4})[\s\.(]"""),
             Regex("""_(\d{1,4})_"""),
         )
         for (pattern in patterns) {
-            val match = pattern.find(fileName)
-            if (match != null) {
-                return match.groupValues[1].toFloatOrNull()
+            val match = pattern.find(fileName) ?: continue
+            if (match.groupValues.size > 2 && match.groupValues[2].isNotEmpty()) {
+                val whole = match.groupValues[1].toFloatOrNull() ?: continue
+                val decimal = match.groupValues[2].toFloatOrNull() ?: continue
+                return whole + decimal / 10f
             }
+            return match.groupValues[1].toFloatOrNull()
         }
         return null
     }
@@ -557,6 +709,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     companion object {
         const val PREFIX_SEARCH = "id:"
         const val PREFIX_GROUP = "group:"
+        const val PREFIX_DBATCH = "dbatch:"
 
         private const val PREF_DOMAIN_KEY = "domain"
         private const val IS_FILENAME_KEY = "filename"
