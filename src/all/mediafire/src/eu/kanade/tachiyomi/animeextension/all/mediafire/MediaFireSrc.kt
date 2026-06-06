@@ -451,9 +451,10 @@ class MediaFireSrc :
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
             key = "mediafire_folder_list"
-            title = "Carpetas guardadas (edición directa)"
-            summary = "Formato: Nombre::https://www.mediafire.com/folder/KEY/nombre\nUna por línea."
-            dialogTitle = "Editar carpetas"
+            title = "Enlaces guardados"
+            summary = "Toca para editar tus enlaces guardados"
+            dialogTitle = "Enlaces guardados"
+            setDialogMessage("Una entrada por línea.\n\nEjemplo:\nNombre::Tu enlace de MediaFire\n\nPara eliminar una entrada, borra la línea completa.")
             setDefaultValue("")
         }.also(screen::addPreference)
 
