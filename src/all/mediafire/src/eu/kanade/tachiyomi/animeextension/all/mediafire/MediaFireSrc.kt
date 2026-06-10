@@ -39,6 +39,9 @@ class MediaFireSrc :
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
+    // Caché en memoria — vive mientras el proceso de la app esté activo
+    private var cachedAnimes: List<SAnime>? = null
+
     // ── API URLs ──────────────────────────────────────────────────────────────
 
     private fun apiFoldersUrl(key: String, chunk: Int = 1) = "$baseUrl/api/1.5/folder/get_content.php" +
@@ -254,6 +257,8 @@ class MediaFireSrc :
     override fun popularAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException()
 
     override suspend fun getPopularAnime(page: Int): AnimesPage {
+        cachedAnimes?.let { return AnimesPage(it, false) }
+
         val animes = MediaFirePreferences.getEntries(preferences).flatMap { entry ->
             if (entry.key.startsWith("file::")) {
                 listOf(
@@ -272,6 +277,8 @@ class MediaFireSrc :
                 )
             }
         }
+
+        cachedAnimes = animes
         return AnimesPage(animes, false)
     }
 
@@ -305,6 +312,7 @@ class MediaFireSrc :
                 ?: filename.substringBeforeLast('.')
 
             MediaFirePreferences.addEntry(preferences, resolvedName, "file::$quickkey::$filename")
+            cachedAnimes = null // invalidar caché para que recargue con la nueva entrada
 
             return AnimesPage(
                 listOf(
@@ -326,6 +334,7 @@ class MediaFireSrc :
                 ?: fetchFolderName(key)
 
             MediaFirePreferences.addEntry(preferences, resolvedName, key)
+            cachedAnimes = null // invalidar caché para que recargue con la nueva entrada
 
             return AnimesPage(
                 expandFolder(
