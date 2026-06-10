@@ -115,16 +115,18 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         return AnimesPage(listOf(details), false)
     }
 
-    private fun parseRangeSpec(rangeSpec: String, videoFiles: List<VideoFile>): List<VideoFile> = try {
-        val segments = rangeSpec.split("--")
-        val rangePart = segments.first()
-        val excluded = segments.drop(1).mapNotNull { it.toIntOrNull() }.toSet()
-        val rangeBounds = rangePart.split("-")
-        val from = rangeBounds.getOrNull(0)?.toIntOrNull() ?: 0
-        val to = rangeBounds.getOrNull(1)?.toIntOrNull() ?: videoFiles.last().index
-        videoFiles.filter { it.index in from..to && it.index !in excluded }
-    } catch (e: Exception) {
-        emptyList()
+    private fun parseRangeSpec(rangeSpec: String, videoFiles: List<VideoFile>): List<VideoFile> {
+        return try {
+            val segments = rangeSpec.split("--")
+            val rangePart = segments.first()
+            val excluded = segments.drop(1).mapNotNull { it.toIntOrNull() }.toSet()
+            val rangeBounds = rangePart.split("-")
+            val from = rangeBounds.getOrNull(0)?.toIntOrNull() ?: return emptyList()
+            val to = rangeBounds.getOrNull(1)?.toIntOrNull() ?: return emptyList()
+            videoFiles.filter { it.index in from..to && it.index !in excluded }
+        } catch (e: Exception) {
+            emptyList()
+        }
     }
 
     private fun searchAnimeByDbatchParse(
@@ -141,7 +143,6 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
 
         val torrentTitle = document.select("h3.panel-title").text()
 
-        // Con rango → un solo SAnime agrupado listo para la biblioteca
         if (rangeSpec != null) {
             val filteredFiles = parseRangeSpec(rangeSpec, videoFiles)
             if (filteredFiles.isEmpty()) return AnimesPage(emptyList(), false)
@@ -155,12 +156,10 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             return AnimesPage(listOf(anime), false)
         }
 
-        // Sin rango → modo exploración
         data class GroupKey(val parent: String, val sub: String)
         val groups = videoFiles.groupBy { GroupKey(it.parentFolder, it.subFolder) }
 
         val animes = if (groups.size == 1) {
-            // Tipo plano: un SAnime por archivo con [N] como ayuda visual
             videoFiles.map { file ->
                 val fileName = file.element.ownText().trim().substringBeforeLast(".")
                 SAnime.create().apply {
@@ -171,7 +170,6 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
                 }
             }
         } else {
-            // Tipo con carpetas: un SAnime por grupo
             groups.map { (key, files) ->
                 val indices = files.joinToString(",") { it.index.toString() }
                 val label = when {
@@ -363,14 +361,20 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             }
         }
 
-        // Renombrar usando el número extraído del nombre actual, no de episode_number
-        allEpisodes.forEach { ep ->
-            if (!preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)) {
-                val epNumber = extractEpisodeNumber(ep.name) ?: ep.episode_number
+        // Normalizar episode_number para que la playlist del reproductor funcione correctamente.
+        // Los torrents sueltos llegan con episode_number = 1f (para evitar "missing items"
+        // cuando se abren individualmente). En group: eso rompe la playlist porque todos
+        // los episodios tienen el mismo número interno. Se extrae el número real del nombre.
+        val useFilename = preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)
+        allEpisodes.forEachIndexed { index, ep ->
+            val epNumber = extractEpisodeNumber(ep.name) ?: (allEpisodes.size - index).toFloat()
+            ep.episode_number = epNumber
+            if (!useFilename) {
                 ep.name = "Episodio ${epNumber.toInt()}"
             }
         }
-        return allEpisodes
+
+        return allEpisodes.sortedByDescending { it.episode_number }
     }
 
     // ============================== Folder-aware file extraction ==============================
@@ -542,7 +546,9 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
                 SEpisode.create().apply {
                     name = if (useFilename) fileName else "Episodio ${realNumber.toInt()}"
                     url = magnet
-                    episode_number = 1f // ← interno siempre 1, evita missing items
+                    // episode_number = 1f para evitar "missing items" cuando se abre individualmente.
+                    // En group: este valor se sobreescribe con el número real en episodeListGroupedParse.
+                    episode_number = 1f
                     scanlator = fileSize
                     date_upload = torrentDate
                 },
