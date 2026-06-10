@@ -61,6 +61,9 @@ class GoogleDrive :
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
+    // Caché en memoria — vive mientras el proceso de la app esté activo
+    private var cachedAnimes: List<SAnime>? = null
+
     // ============================== Popular ===============================
 
     override fun popularAnimeRequest(page: Int): Request = throw UnsupportedOperationException()
@@ -86,6 +89,8 @@ class GoogleDrive :
     }
 
     override suspend fun getPopularAnime(page: Int): AnimesPage {
+        cachedAnimes?.let { return AnimesPage(it, false) }
+
         migrateLegacyPrefs()
 
         val entries = GoogleDrivePreferences.getEntries(preferences)
@@ -178,6 +183,7 @@ class GoogleDrive :
             }
         }
 
+        cachedAnimes = animeList
         return AnimesPage(animeList, false)
     }
 
@@ -215,10 +221,13 @@ class GoogleDrive :
                 ?: folderId
 
             GoogleDrivePreferences.addEntry(preferences, entryName, folderUrl)
+            cachedAnimes = null // invalidar caché para que recargue con la nueva carpeta
 
             addSinglePage(folderUrl)
         } else if (query.isNotBlank()) {
-            parsePage(GET(query), page)
+            // FIX: antes hacía parsePage(GET(query), page) — incorrecto, query no es una URL
+            val all = getPopularAnime(page)
+            AnimesPage(all.animes.filter { it.title.contains(query, ignoreCase = true) }, false)
         } else {
             getPopularAnime(page)
         }
@@ -464,15 +473,17 @@ class GoogleDrive :
             defaultGetRequest(folderIdStr, nextPageTokenStr, keyStr)
         },
     ): Request {
+        // FIX: keyScript y versionScript usaban ambos KEY_REGEX — ahora cada uno usa su regex correcta
         val keyScript = document.select("script").first { script ->
             KEY_REGEX.find(script.data()) != null
         }.data()
         val key = KEY_REGEX.find(keyScript)?.groupValues?.get(1) ?: ""
 
         val versionScript = document.select("script").first { script ->
-            KEY_REGEX.find(script.data()) != null
+            VERSION_REGEX.find(script.data()) != null
         }.data()
         val driveVersion = VERSION_REGEX.find(versionScript)?.groupValues?.get(1) ?: ""
+
         val sapisid =
             client.cookieJar.loadForRequest("https://drive.google.com".toHttpUrl()).firstOrNull {
                 it.name == "SAPISID" || it.name == "__Secure-3PAPISID"
@@ -603,19 +614,6 @@ class GoogleDrive :
             .digest("$timeNow $SAPISID $origin".toByteArray())
             .joinToString("") { "%02x".format(it) }
         return "SAPISIDHASH ${timeNow}_$sapisidhash"
-    }
-
-    private fun String.trimInfo(): String {
-        var newString = this.replaceFirst("""^\[\w+\] ?""".toRegex(), "")
-        val regex = """( ?\[[\s\w-]+\]| ?\([\s\w-]+\))(\.mkv|\.mp4|\.avi)?${'$'}""".toRegex()
-
-        while (regex.containsMatchIn(newString)) {
-            newString = regex.replace(newString) { matchResult ->
-                matchResult.groups[2]?.value ?: ""
-            }
-        }
-
-        return newString.trim()
     }
 
     private fun formatBytes(bytes: Long): String = when {
