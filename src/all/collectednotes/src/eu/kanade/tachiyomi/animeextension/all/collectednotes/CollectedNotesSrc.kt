@@ -129,7 +129,7 @@ class CollectedNotesSrc :
                 .removeSuffix(".json")
                 .trim()
             val resolvedName = nameFilter.state.trim().takeIf { it.isNotBlank() } ?: sitePath
-            CollectedNotesPreferences.addEntry(preferences, resolvedName, sitePath)
+            CollectedNotesPreferences.addEntry(preferences, resolvedName, "https://collectednotes.com/$sitePath")
             cachedAnimes = null
             return getPopularAnime(page)
         }
@@ -224,9 +224,15 @@ class CollectedNotesSrc :
                 val epNumber = EP_NUMBER_REGEX.find(epName)?.groupValues?.get(1)?.toFloatOrNull()
                     ?: counter.toFloat()
 
+                val realName = if (showFilename) {
+                    val fileId = DRIVE_FILE_ID_REGEX.find(driveUrl)?.groupValues?.get(1)
+                    if (fileId != null) getDriveFileName(fileId) ?: epName else epName
+                } else {
+                    "Episodio $counter"
+                }
                 episodes.add(
                     SEpisode.create().apply {
-                        name = if (showFilename) epName else "Episodio $counter"
+                        name = realName
                         url = driveUrl
                         episode_number = epNumber
                         date_upload = runCatching {
@@ -251,6 +257,19 @@ class CollectedNotesSrc :
             ?: DRIVE_UC_ID_REGEX.find(episode.url)?.groupValues?.get(1)
             ?: throw Exception("No se pudo extraer el ID del archivo de Drive")
         return GoogleDriveExtractor(client, headers).videosFromUrl(fileId)
+    }
+
+    // ===================== Drive file name resolver ======================
+
+    private fun getDriveFileName(fileId: String): String? = try {
+        val url = "https://drive.google.com/file/d/$fileId/view"
+        val doc = client.newCall(GET(url, driveHeaders)).execute().asJsoup()
+        doc.selectFirst("title")?.text()
+            ?.removeSuffix(" - Google Drive")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+    } catch (_: Exception) {
+        null
     }
 
     // ==================== Drive folder listing (temporal) =================
@@ -461,13 +480,6 @@ class CollectedNotesSrc :
     // ============================== Settings ==============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_SHOW_FILENAME
-            title = "Mostrar nombre del archivo"
-            summary = "Activado: muestra el nombre real del episodio.\nDesactivado: muestra \"Episodio 1\", \"Episodio 2\"…"
-            setDefaultValue(true)
-        }.also(screen::addPreference)
-
         EditTextPreference(screen.context).apply {
             key = CollectedNotesPreferences.PREF_KEY
             title = "Fansubs guardados"
@@ -477,6 +489,13 @@ class CollectedNotesSrc :
                 "Una entrada por línea.\n\nEjemplo:\nNombre::URL de Collected Notes\n\nPara eliminar una entrada, borra la línea completa.",
             )
             setDefaultValue("")
+        }.also(screen::addPreference)
+
+        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SHOW_FILENAME
+            title = "Mostrar nombre del archivo"
+            summary = "Activado: muestra el nombre real del episodio.\nDesactivado: muestra \"Episodio 1\", \"Episodio 2\"…"
+            setDefaultValue(true)
         }.also(screen::addPreference)
     }
 
