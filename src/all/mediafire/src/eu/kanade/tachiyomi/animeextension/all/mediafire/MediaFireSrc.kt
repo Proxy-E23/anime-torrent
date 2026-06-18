@@ -39,7 +39,6 @@ class MediaFireSrc :
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
-    // Caché en memoria — vive mientras el proceso de la app esté activo
     private var cachedAnimes: List<SAnime>? = null
 
     // ── API URLs ──────────────────────────────────────────────────────────────
@@ -116,6 +115,16 @@ class MediaFireSrc :
         key
     }
 
+    // FIX: detectar si una carpeta existe verificando la respuesta de la API
+    private fun isFolderMissing(key: String): Boolean = try {
+        val body = client.newCall(GET(apiFolderInfoUrl(key))).execute().body.string()
+        // La API devuelve result=Error con error=112 cuando la carpeta no existe
+        // Puede venir en JSON o XML dependiendo del estado
+        "Error" in body && ("112" in body || "Unknown or invalid" in body)
+    } catch (e: Exception) {
+        false
+    }
+
     private fun fetchAllFolders(key: String): List<MFFolder> {
         val list = mutableListOf<MFFolder>()
         var chunk = 1
@@ -151,11 +160,9 @@ class MediaFireSrc :
             .build()
     }
 
-    /** Devuelve la URL directa del CDN para que mpv la pueda reproducir. */
     private fun resolveDirectVideoUrl(quickkey: String, filename: String): String {
         val noRedirectClient = client.newBuilder().followRedirects(false).build()
 
-        // 1. get_links API -> normal_download -> seguir redirect con headers de navegador
         try {
             val apiUrl = "$baseUrl/api/1.5/file/get_links.php" +
                 "?quick_key=$quickkey&link_type=normal_download&response_format=json"
@@ -172,7 +179,6 @@ class MediaFireSrc :
             }
         } catch (_: Exception) {}
 
-        // 2. Fallback: cargar la pagina y seguir el redirect del boton de descarga
         val encodedFilename = java.net.URLEncoder.encode(filename, "UTF-8").replace("+", "%20")
         val pageUrl = "$baseUrl/file/$quickkey/$encodedFilename"
         return try {
@@ -270,11 +276,24 @@ class MediaFireSrc :
                     },
                 )
             } else {
-                expandFolder(
-                    key = entry.key,
-                    folderName = entry.name,
-                    parentTitle = "",
-                )
+                // FIX: verificar si la carpeta existe antes de expandir
+                if (isFolderMissing(entry.key)) {
+                    listOf(
+                        SAnime.create().apply {
+                            title = "❌ ${entry.name} (Carpeta eliminada)"
+                            thumbnail_url = "https://http.cat/404"
+                            url = "missing::${entry.key}::${entry.name}"
+                            status = SAnime.UNKNOWN
+                            description = "Esta carpeta fue eliminada o ya no esta disponible.\n\nPara eliminarla, copia la linea de abajo y pegala en Ajustes → Eliminar enlace:\n\n${entry.name}::https://www.mediafire.com/folder/${entry.key}"
+                        },
+                    )
+                } else {
+                    expandFolder(
+                        key = entry.key,
+                        folderName = entry.name,
+                        parentTitle = "",
+                    )
+                }
             }
         }
 
@@ -312,7 +331,7 @@ class MediaFireSrc :
                 ?: filename.substringBeforeLast('.')
 
             MediaFirePreferences.addEntry(preferences, resolvedName, "file::$quickkey::$filename")
-            cachedAnimes = null // invalidar caché para que recargue con la nueva entrada
+            cachedAnimes = null
 
             return AnimesPage(
                 listOf(
@@ -334,7 +353,7 @@ class MediaFireSrc :
                 ?: fetchFolderName(key)
 
             MediaFirePreferences.addEntry(preferences, resolvedName, key)
-            cachedAnimes = null // invalidar caché para que recargue con la nueva entrada
+            cachedAnimes = null
 
             return AnimesPage(
                 expandFolder(
@@ -361,7 +380,7 @@ class MediaFireSrc :
         UrlFilter(),
         NameFilter(),
         SeparatorFilter(),
-        InfoFilter("Deja los campos vacíos para buscar por nombre"),
+        InfoFilter("Deja los campos vacios para buscar por nombre"),
     )
 
     // ── Detalles ──────────────────────────────────────────────────────────────
@@ -369,6 +388,7 @@ class MediaFireSrc :
     override fun animeDetailsRequest(anime: SAnime): Request {
         val key = anime.url
         val webUrl = when {
+            key.startsWith("missing::") -> baseUrl
             key.startsWith("file::") -> {
                 val parts = key.split("::")
                 "$baseUrl/file/${parts[1]}/${parts[2]}"
@@ -381,7 +401,10 @@ class MediaFireSrc :
         }
         return GET(webUrl)
     }
+
     override fun animeDetailsParse(response: Response): SAnime = throw UnsupportedOperationException()
+
+    // FIX: si es una entrada de error, devolver el anime tal cual para preservar la descripcion
     override suspend fun getAnimeDetails(anime: SAnime): SAnime = anime
 
     // ── Episodios ─────────────────────────────────────────────────────────────
@@ -391,6 +414,9 @@ class MediaFireSrc :
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
         val url = anime.url
+
+        // FIX: entrada de error — sin episodios
+        if (url.startsWith("missing::")) return emptyList()
 
         if (url.startsWith("file::")) {
             val parts = url.split("::")
@@ -458,21 +484,56 @@ class MediaFireSrc :
     // ── Preferencias ──────────────────────────────────────────────────────────
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        EditTextPreference(screen.context).apply {
+        SwitchPreferenceCompat(screen.context).apply {
+            key = MediaFirePreferences.PREF_SHOW_FILENAME
+            title = "Mostrar nombre del archivo"
+            summary = "Activado: muestra el nombre real del archivo.\nDesactivado: muestra \"Episodio 1\", \"Episodio 2\"..."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
+
+        val folderListPref = EditTextPreference(screen.context).apply {
             key = "mediafire_folder_list"
             title = "Enlaces guardados"
             summary = "Toca para editar tus enlaces guardados"
             dialogTitle = "Enlaces guardados"
-            setDialogMessage("Una entrada por línea.\n\nEjemplo:\nNombre::Tu enlace de MediaFire\n\nPara eliminar una entrada, borra la línea completa.")
+            setDialogMessage("Una entrada por linea.\n\nEjemplo:\nNombre::Tu enlace de MediaFire\n\nPara eliminar una entrada, borra la linea completa.\n\nPara ver los cambios reflejados en el catalogo, cierra y vuelve a abrir la extension.")
             setDefaultValue("")
+            setOnPreferenceChangeListener { _, _ ->
+                cachedAnimes = null
+                true
+            }
         }.also(screen::addPreference)
 
-        SwitchPreferenceCompat(screen.context).apply {
-            key = MediaFirePreferences.PREF_SHOW_FILENAME
-            title = "Mostrar nombre del archivo"
-            summary = "Activado: muestra el nombre real del archivo.\nDesactivado: muestra \"Episodio 1\", \"Episodio 2\"…"
-            setDefaultValue(true)
-        }.also(screen::addPreference)
+        // FIX: campo para eliminar un enlace facilmente
+        lateinit var removeEntryPref: EditTextPreference
+        removeEntryPref = EditTextPreference(screen.context).apply {
+            key = "mediafire_remove_entry"
+            title = "Eliminar enlace"
+            summary = "Pega aqui la linea Nombre::URL que aparece en la descripcion de la carpeta eliminada"
+            dialogTitle = "Eliminar enlace"
+            setDialogMessage("Copia la linea Nombre::URL desde la descripcion de la entrada con error y pegala aqui para eliminarla de tus enlaces guardados.\n\nPara ver los cambios reflejados en el catalogo, cierra y vuelve a abrir la extension.")
+            setDefaultValue("")
+            setOnPreferenceChangeListener { _, newValue ->
+                val lineToRemove = (newValue as String).trim()
+                if (lineToRemove.isNotBlank()) {
+                    val current = preferences.getString("mediafire_folder_list", "") ?: ""
+                    val updated = current.lines()
+                        .filter { it.trim() != lineToRemove }
+                        .joinToString("\n")
+                    preferences.edit().putString("mediafire_folder_list", updated).apply()
+                    cachedAnimes = null
+
+                    folderListPref.text = updated
+
+                    preferences.edit().putString("mediafire_remove_entry", "").commit()
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        removeEntryPref.text = ""
+                    }
+                }
+                true
+            }
+        }
+        screen.addPreference(removeEntryPref)
     }
 
     override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException()
