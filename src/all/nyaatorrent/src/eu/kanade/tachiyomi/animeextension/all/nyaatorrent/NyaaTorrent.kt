@@ -279,6 +279,12 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         val magnet = document.selectFirst("a[href^='magnet:']")?.attr("href").orEmpty()
         if (magnet.isEmpty()) return emptyList()
 
+        val torrentId = response.request.url.toString()
+            .substringAfter("/view/")
+            .substringBefore("/")
+            .substringBefore("#")
+            .substringBefore("?")
+
         val rawDbatch = response.request.url.queryParameter("dbatch") ?: return emptyList()
         val allowedIndices = rawDbatch.split(",").mapNotNull { it.trim().toIntOrNull() }.toSet()
 
@@ -289,6 +295,15 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         val videoFiles = extractVideoFiles(document).filter { it.index in allowedIndices }
 
         if (videoFiles.isEmpty()) return emptyList()
+
+        // allowedIndices viene en términos de índice-HTML (de searchAnimeByDbatchParse),
+        // así que el filtro de arriba es correcto. Solo el index en la url
+        // necesita resolverse al índice real del .torrent.
+        val realIndexMap = if (torrentId.isNotEmpty()) {
+            resolveRealIndices(videoFiles, torrentId)
+        } else {
+            emptyMap()
+        }
 
         val unknownFolderMap = mutableMapOf<String, Int>()
         var partCounter = 1
@@ -313,16 +328,16 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             counter[folderKey] = current
 
             val fileName = file.element.ownText().trim()
-            val realEpNumber = extractEpisodeNumber(fileName) ?: (localIndex + 1).toFloat()
             val fileSize = file.element.select("span.file-size").text()
+            val streamIndex = realIndexMap[file.index] ?: file.index
 
             SEpisode.create().apply {
                 name = if (useFilename) {
                     fileName
                 } else {
-                    if (isExtra) "Extra $current" else "Episodio ${realEpNumber.toInt()}"
+                    if (isExtra) "Extra $current" else "Episodio $current"
                 }
-                url = "$magnet&index=${file.index}"
+                url = "$magnet&index=$streamIndex"
                 episode_number = (localIndex + 1).toFloat()
                 scanlator = fileSize
                 date_upload = torrentDate
@@ -406,6 +421,124 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         return "$keyword $number"
     }
 
+    // ===================== Real file order (bencoding) =====================
+    // nyaa.si lista los archivos alfabéticamente en el HTML, pero el motor de
+    // torrent-streaming necesita el índice real de info.files del .torrent.
+    // Se descarga el .torrent vía HTTP plano y se decodifica el bencoding
+    // manualmente para mapear nombre→índice real sin tocar el servicio torrent.
+
+    private class BencodeDecoder(private val data: ByteArray) {
+        var pos = 0
+
+        fun decode(): Any = when (data[pos].toInt().toChar()) {
+            'i' -> decodeInt()
+            'l' -> decodeList()
+            'd' -> decodeDict()
+            else -> decodeString()
+        }
+
+        private fun decodeInt(): Long {
+            pos++ // skip 'i'
+            val end = indexOf('e'.code.toByte())
+            val value = String(data, pos, end - pos, Charsets.US_ASCII).toLong()
+            pos = end + 1
+            return value
+        }
+
+        private fun decodeString(): ByteArray {
+            val colon = indexOf(':'.code.toByte())
+            val length = String(data, pos, colon - pos, Charsets.US_ASCII).toInt()
+            val start = colon + 1
+            val result = data.copyOfRange(start, start + length)
+            pos = start + length
+            return result
+        }
+
+        private fun decodeList(): List<Any> {
+            pos++ // skip 'l'
+            val result = mutableListOf<Any>()
+            while (data[pos].toInt().toChar() != 'e') {
+                result.add(decode())
+            }
+            pos++ // skip 'e'
+            return result
+        }
+
+        private fun decodeDict(): Map<ByteArray, Any> {
+            pos++ // skip 'd'
+            val result = LinkedHashMap<ByteArray, Any>()
+            while (data[pos].toInt().toChar() != 'e') {
+                val key = decodeString()
+                val value = decode()
+                result[key] = value
+            }
+            pos++ // skip 'e'
+            return result
+        }
+
+        private fun indexOf(target: Byte): Int {
+            var i = pos
+            while (data[i] != target) i++
+            return i
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun fetchRealFileOrder(torrentId: String): List<String>? {
+        return try {
+            val torrentBytes = client.newCall(GET("$baseUrl/download/$torrentId.torrent"))
+                .execute()
+                .use { response ->
+                    if (!response.isSuccessful) return null
+                    response.body?.bytes()
+                } ?: return null
+
+            val decoded = BencodeDecoder(torrentBytes).decode() as? Map<ByteArray, Any> ?: return null
+            val infoKey = decoded.keys.firstOrNull { it.toString(Charsets.UTF_8) == "info" } ?: return null
+            val info = decoded[infoKey] as? Map<ByteArray, Any> ?: return null
+
+            val filesKey = info.keys.firstOrNull { it.toString(Charsets.UTF_8) == "files" }
+            if (filesKey != null) {
+                val files = info[filesKey] as? List<Any> ?: return null
+                files.mapNotNull { fileEntry ->
+                    val fileDict = fileEntry as? Map<ByteArray, Any> ?: return@mapNotNull null
+                    val pathKey = fileDict.keys.firstOrNull { it.toString(Charsets.UTF_8) == "path" }
+                    val pathList = fileDict[pathKey] as? List<Any> ?: return@mapNotNull null
+                    val pathParts = pathList.mapNotNull { (it as? ByteArray)?.toString(Charsets.UTF_8) }
+                    pathParts.lastOrNull()
+                }
+            } else {
+                val nameKey = info.keys.firstOrNull { it.toString(Charsets.UTF_8) == "name" } ?: return null
+                val name = (info[nameKey] as? ByteArray)?.toString(Charsets.UTF_8) ?: return null
+                listOf(name)
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun resolveRealIndices(videoFiles: List<VideoFile>, torrentId: String): Map<Int, Int> {
+        val realOrder = fetchRealFileOrder(torrentId) ?: return emptyMap()
+
+        // Archivos con nombre repetido en distintas carpetas (ej. "NCED01.mkv"
+        // en Season 1/Extras y Season 2/Extras) se emparejan por ORDEN DE
+        // OCURRENCIA: la N-ésima aparición en el HTML con la N-ésima en el
+        // .torrent, evitando que indexOf() siempre devuelva la primera.
+        val realOrderQueueByName = mutableMapOf<String, ArrayDeque<Int>>()
+        realOrder.forEachIndexed { realIndex, name ->
+            realOrderQueueByName.getOrPut(name) { ArrayDeque() }.addLast(realIndex)
+        }
+
+        val result = mutableMapOf<Int, Int>()
+        for (file in videoFiles) {
+            val fileName = file.element.ownText().trim()
+            val queue = realOrderQueueByName[fileName] ?: continue
+            val realIndex = queue.removeFirstOrNull() ?: continue
+            result[file.index] = realIndex
+        }
+        return result
+    }
+
     private fun extractVideoFiles(document: Document): List<VideoFile> {
         val result = mutableListOf<VideoFile>()
         var globalIndex = 0
@@ -476,7 +609,6 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     private fun buildEpisodeName(
         file: VideoFile,
         episodeNumber: Int,
-        realEpisodeNumber: Float,
         isExtra: Boolean,
         useFilename: Boolean,
         unknownFolderMap: Map<String, Int>,
@@ -515,7 +647,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         return if (useFilename) {
             "$prefix$fileName"
         } else {
-            val label = if (isExtra) "Extra $episodeNumber" else "Episodio ${realEpisodeNumber.toInt()}"
+            val label = if (isExtra) "Extra $episodeNumber" else "Episodio $episodeNumber"
             "$prefix$label"
         }
     }
@@ -524,6 +656,12 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         val document = response.asJsoup()
         val magnet = document.selectFirst("a[href^='magnet:']")?.attr("href").orEmpty()
         if (magnet.isEmpty()) return emptyList()
+
+        val torrentId = response.request.url.toString()
+            .substringAfter("/view/")
+            .substringBefore("/")
+            .substringBefore("#")
+            .substringBefore("?")
 
         val torrentDate = parseDate(
             document.select("div.panel-body > div:nth-child(1) > div:nth-child(4)").text(),
@@ -555,6 +693,15 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             )
         }
 
+        // El índice HTML puede diferir del índice real del .torrent si el
+        // uploader no añadió los archivos en orden alfabético. Se resuelve
+        // descargando el .torrent; si falla, cae al índice HTML como fallback.
+        val realIndexMap = if (torrentId.isNotEmpty()) {
+            resolveRealIndices(videoFiles, torrentId)
+        } else {
+            emptyMap()
+        }
+
         val unknownFolderMap = mutableMapOf<String, Int>()
         var partCounter = 1
         videoFiles
@@ -566,6 +713,15 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
                     unknownFolderMap[folder] = partCounter++
                 }
             }
+
+        // Orden de aparición de carpetas en el HTML para agrupar temporadas
+        // en la lista final (más reciente arriba) sin que temporadas con
+        // numeración propia (ej. S01E26 y S02E26 → ambas "26") se intercalen.
+        val folderAppearanceOrder = videoFiles
+            .map { it.parentFolder }
+            .distinct()
+            .withIndex()
+            .associate { (i, folder) -> folder to i }
 
         val episodeCounterByFolder = mutableMapOf<String, Int>()
         val extraCounterByFolder = mutableMapOf<String, Int>()
@@ -579,21 +735,35 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             counter[folderKey] = current
 
             val fileName = file.element.ownText().trim()
-            val realEpNumber = extractEpisodeNumber(fileName) ?: file.index.toFloat()
+            // Extras: eje negativo (nunca choca con episodios reales al
+            // ordenar descendente) pero proporcional a current para que
+            // el extra de mayor número quede primero (Extra 4, 3, 2, 1).
+            val realEpNumber = if (isExtra) {
+                current.toFloat() - 1000f
+            } else {
+                extractEpisodeNumber(fileName) ?: file.index.toFloat()
+            }
 
-            val epName = buildEpisodeName(file, current, realEpNumber, isExtra, useFilename, unknownFolderMap)
+            val epName = buildEpisodeName(file, current, isExtra, useFilename, unknownFolderMap)
             val fileSize = file.element.select("span.file-size").text()
+            val streamIndex = realIndexMap[file.index] ?: file.index
+            val seasonOrder = folderAppearanceOrder[folderKey] ?: 0
 
             SEpisode.create().apply {
                 name = epName
-                url = "$magnet&index=${file.index}"
-                episode_number = file.index.toFloat()
+                url = "$magnet&index=$streamIndex"
+                episode_number = realEpNumber
                 scanlator = fileSize
                 date_upload = torrentDate
-            }
+            } to seasonOrder
         }
 
-        return episodes.sortedByDescending { it.episode_number }
+        return episodes
+            .sortedWith(
+                compareByDescending<Pair<SEpisode, Int>> { it.second }
+                    .thenByDescending { it.first.episode_number },
+            )
+            .map { it.first }
     }
 
     private fun extractEpisodeNumber(fileName: String): Float? {
