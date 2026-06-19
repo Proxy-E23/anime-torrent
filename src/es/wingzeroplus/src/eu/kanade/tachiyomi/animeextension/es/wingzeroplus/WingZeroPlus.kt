@@ -27,6 +27,10 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
 
     // ============================== Popular ===============================
 
+    // Por defecto mostramos Series en "popular". El filtro de Tipo permite cambiar a Películas
+    // desde la búsqueda (Aniyomi aplica los filtros incluso sin texto de búsqueda).
+    private var contentType = "series"
+
     override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/series?p=$page", headers)
 
     override fun popularAnimeSelector(): String = "div#tm-right-section div.uk-grid div.uk-margin-bottom"
@@ -69,7 +73,11 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
     override fun searchAnimeParse(response: Response): AnimesPage = popularAnimeParse(response)
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val url = "$baseUrl/series".toHttpUrl().newBuilder().apply {
+        val typeFilter = filters.find { it is TypeFilter } as? TypeFilter
+        val isMovie = typeFilter?.toUriPart() == "movies"
+        val path = if (isMovie) "movies" else "series"
+
+        val url = "$baseUrl/$path".toHttpUrl().newBuilder().apply {
             if (query.isNotBlank()) addQueryParameter("title", query)
             filters.forEach { filter ->
                 when (filter) {
@@ -117,6 +125,23 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
             url = relUrl // se convierte a absoluta en episodeListParse
             episode_number = epNum
         }
+    }
+
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        // Las películas no tienen lista de episodios: un solo "episodio" que
+        // apunta a single-movie?watch=1 dentro de la misma URL de la película.
+        if (anime.url.contains("/movie/")) {
+            val movieUrl = baseUrl + anime.url
+            return listOf(
+                SEpisode.create().apply {
+                    name = "Película"
+                    url = "$movieUrl/single-movie?watch=1"
+                    episode_number = 1F
+                },
+            )
+        }
+        val response = client.newCall(episodeListRequest(anime)).execute()
+        return episodeListParse(response)
     }
 
     override fun episodeListParse(response: Response): List<SEpisode> {
@@ -186,10 +211,20 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
     // ============================== Filters ===============================
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        TypeFilter(),
         AnimeFilter.Header("Los filtros no funcionan junto con búsqueda de texto"),
         GenreFilter(),
         YearFilter(),
     )
+
+    private class TypeFilter :
+        UriPartFilter(
+            "Tipo de contenido",
+            arrayOf(
+                Pair("Series", "series"),
+                Pair("Películas", "movies"),
+            ),
+        )
 
     private class GenreFilter :
         UriPartFilter(
