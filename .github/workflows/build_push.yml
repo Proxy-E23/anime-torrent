@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - beta
     paths:
       - '**'
       - '!**.md'
@@ -181,7 +182,7 @@ jobs:
         with:
           repository: Proxy-E23/A-Repo
           token: ${{ secrets.BOT_PAT }}
-          ref: repo
+          ref: ${{ github.ref_name == 'master' && 'repo' || 'beta-repo' }}
           path: repo
           fetch-depth: 0
           persist-credentials: true
@@ -200,3 +201,4 @@ jobs:
           cwd: "./repo"
           # committer_name: github-actions[bot]
           # committer_email: github-actions[bot]@users.noreply.github.com
+          
