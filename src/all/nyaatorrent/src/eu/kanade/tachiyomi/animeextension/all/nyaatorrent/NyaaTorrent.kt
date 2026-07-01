@@ -21,6 +21,7 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -149,7 +150,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             val indices = filteredFiles.joinToString(",") { it.index.toString() }
             val anime = SAnime.create().apply {
                 title = torrentTitle
-                url = "/view/$torrentId?dbatch=$indices"
+                url = "/view/$torrentId?dbatch=$indices&range=$rangeSpec"
                 thumbnail_url = null
                 description = "Parte de: $torrentTitle\nRango: $rangeSpec"
             }
@@ -226,43 +227,97 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     // =========================== Anime Details ============================
     override fun animeDetailsParse(document: Document): SAnime {
         val anime = SAnime.create()
+        val location = document.location()
+        val isGrouped = location.contains("grouped=1")
+        val isDbatch = location.contains("dbatch=")
 
-        val torrentId = document.location()
-            .substringAfter("/view/")
-            .substringBefore("/")
-            .substringBefore("#")
-            .substringBefore("?")
-
-        val category = document.select("div.panel-body > div:nth-child(1) > div:nth-child(2)").text()
-        val seeders = document.select("div.panel-body > div:nth-child(2) > div:nth-child(4)").text()
-        val leechers = document.select("div.panel-body > div:nth-child(3) > div:nth-child(4) > span").text()
-        val filesize = document.select("div.panel-body > div:nth-child(4) > div:nth-child(2)").text()
-        val genre = mutableListOf<String>()
-        genre.add("Category: $category")
-        genre.add("Seeders: $seeders")
-        genre.add("Leechers: $leechers")
-        genre.add("File Size: $filesize")
-        anime.genre = genre.joinToString(", ")
-
-        val desc = document.select("#torrent-description").text()
-
-        anime.description = buildString {
-            if (torrentId.isNotEmpty()) {
-                append("ID: $torrentId\n\n")
+        if (isGrouped) {
+            val rows = document.select("table.torrent-list tbody tr")
+            val totalSeeders = rows.sumOf {
+                it.select("td:nth-child(6)").text().trim().toIntOrNull() ?: 0
             }
-            append(desc)
-        }
+            val totalLeechers = rows.sumOf {
+                it.select("td:nth-child(7)").text().trim().toIntOrNull() ?: 0
+            }
+            val totalSize = sumSizeTexts(
+                rows.mapNotNull { it.select("td:nth-child(4)").text().trim().takeIf { s -> s.isNotEmpty() } },
+            )
+            anime.genre = "↑ Seeders: $totalSeeders, ↓ Leechers: $totalLeechers, Tamaño: $totalSize"
 
-        anime.author = document.select("a[title=user]").text()
-        val imageRegex = Regex("""\b(http|https)?:\S+(?:jpg|png|gif|bmp|webp|tiff|jpeg)(?!\.html)\b""", RegexOption.IGNORE_CASE)
-        val match = imageRegex.find(desc)
-        if (match != null) {
-            anime.thumbnail_url = match.value
+            // Extraer query de la URL para mostrarlo en la descripción
+            val query = location.substringAfter("&q=").substringBefore("&")
+                .replace("+", " ").let { URLDecoder.decode(it, "UTF-8") }
+            anime.description = "group:$query"
+        } else {
+            val torrentId = location
+                .substringAfter("/view/")
+                .substringBefore("/")
+                .substringBefore("#")
+                .substringBefore("?")
+
+            val filesize = document.select("div.panel-body > div:nth-child(4) > div:nth-child(2)").text()
+            val seedersText = document.select("div.panel-body > div:nth-child(2) > div:nth-child(4)").text()
+            val leechersText = document.select("div.panel-body > div:nth-child(3) > div:nth-child(4) > span").text()
+            anime.genre = "↑ Seeders: $seedersText, ↓ Leechers: $leechersText, Tamaño: $filesize"
+
+            if (isDbatch) {
+                val queryParams = location.substringAfter("?", "")
+                    .split("&")
+                    .associate { param ->
+                        val key = param.substringBefore("=")
+                        val value = param.substringAfter("=", "")
+                        key to value
+                    }
+                val rangeParam = queryParams["range"] ?: ""
+                val prefix = if (rangeParam.isNotEmpty()) {
+                    "dbatch:$torrentId:$rangeParam"
+                } else {
+                    "dbatch:$torrentId"
+                }
+                anime.description = prefix
+            } else {
+                val desc = document.select("#torrent-description").text()
+                anime.description = buildString {
+                    if (torrentId.isNotEmpty()) append("ID: $torrentId\n\n")
+                    append(desc)
+                }
+                anime.author = document.select("a[title=user]").text()
+                val imageRegex = Regex(
+                    """\b(http|https)?:\S+(?:jpg|png|gif|bmp|webp|tiff|jpeg)(?!\.html)\b""",
+                    RegexOption.IGNORE_CASE,
+                )
+                imageRegex.find(desc)?.let { anime.thumbnail_url = it.value }
+            }
         }
         return anime
     }
 
     // ============================== Episodes ==============================
+    private fun extractSeedersLeechers(document: Document): String {
+        val seeders = document.select("div.panel-body > div:nth-child(2) > div:nth-child(4)").text()
+        val leechers = document.select("div.panel-body > div:nth-child(3) > div:nth-child(4) > span").text()
+        return "↑$seeders ↓$leechers"
+    }
+
+    // Convierte tamaños tipo "364.9 MiB" o "1.4 GiB" a MiB, suma, y formatea.
+    private fun sumSizeTexts(sizes: List<String>): String {
+        val totalMiB = sizes.sumOf { raw ->
+            val parts = raw.trim().split(" ")
+            val value = parts.getOrNull(0)?.toDoubleOrNull() ?: 0.0
+            when (parts.getOrNull(1)?.uppercase()) {
+                "GIB" -> value * 1024.0
+                "MIB" -> value
+                "KIB" -> value / 1024.0
+                else -> 0.0
+            }
+        }
+        return if (totalMiB >= 1024.0) {
+            "%.2f GiB".format(totalMiB / 1024.0)
+        } else {
+            "%.1f MiB".format(totalMiB)
+        }
+    }
+
     override fun episodeListSelector() = "div.torrent-file-list ul li"
 
     override fun episodeListParse(response: Response): List<SEpisode> {
@@ -370,7 +425,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         for (detailUrl in torrentDetailUrls) {
             try {
                 val detailResponse = client.newCall(GET(detailUrl)).execute()
-                allEpisodes.addAll(episodeListSingleParseHtml(detailResponse))
+                allEpisodes.addAll(episodeListSingleParseHtml(detailResponse, includeSeedersLeechers = true))
             } catch (e: Exception) {
                 // página inaccesible, se omite
             }
@@ -652,7 +707,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         }
     }
 
-    private fun episodeListSingleParseHtml(response: Response): List<SEpisode> {
+    private fun episodeListSingleParseHtml(response: Response, includeSeedersLeechers: Boolean = false): List<SEpisode> {
         val document = response.asJsoup()
         val magnet = document.selectFirst("a[href^='magnet:']")?.attr("href").orEmpty()
         if (magnet.isEmpty()) return emptyList()
@@ -666,6 +721,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         val torrentDate = parseDate(
             document.select("div.panel-body > div:nth-child(1) > div:nth-child(4)").text(),
         )
+        val seedersLeechers = if (includeSeedersLeechers) " ${extractSeedersLeechers(document)}" else ""
         val useFilename = preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)
         val videoFiles = extractVideoFiles(document)
 
@@ -687,7 +743,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
                     // episode_number = 1f para evitar "missing items" cuando se abre individualmente.
                     // En group: este valor se sobreescribe con el número real en episodeListGroupedParse.
                     episode_number = 1f
-                    scanlator = fileSize
+                    scanlator = "$fileSize$seedersLeechers"
                     date_upload = torrentDate
                 },
             )
@@ -753,7 +809,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
                 name = epName
                 url = "$magnet&index=$streamIndex"
                 episode_number = realEpNumber
-                scanlator = fileSize
+                scanlator = "$fileSize$seedersLeechers"
                 date_upload = torrentDate
             } to seasonOrder
         }
